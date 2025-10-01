@@ -27,7 +27,7 @@ class PhysiologicalGraph:
             'pancreas': 0.001, 'adrenal': 0.0002, 'thyroid': 0.0002
         }
         
-        # Blood flow rates (L/h/kg)
+        # Blood flow rates (L/min/kg)
         self.blood_flows = {
             'plasma': 5.0, 'liver': 0.8, 'kidney': 0.6, 'brain': 0.5,
             'heart': 0.3, 'muscle': 1.2, 'fat': 0.2, 'lung': 5.0,
@@ -74,7 +74,7 @@ class DrugProperties:
         self.molecular_weight = np.random.uniform(150, 800)  # Da
         self.log_p = np.random.uniform(-1, 5)  # Lipophilicity
         self.fu_plasma = np.random.uniform(0.01, 0.95)  # Unbound fraction in plasma
-        self.clearance = np.random.uniform(0.1, 10.0)  # L/h/kg
+        self.clearance = np.random.uniform(0.1, 10.0)  # L/min/kg
         self.volume_distribution = np.random.uniform(0.1, 20.0)  # L/kg
         
         # Tissue-specific properties
@@ -85,11 +85,13 @@ class DrugProperties:
     def _generate_tissue_affinity(self) -> Dict[str, float]:
         """Generate tissue-specific affinity coefficients"""
         affinity = {}
-        for organ in ['liver', 'kidney', 'brain', 'heart', 'muscle', 'fat', 
+        for organ in ['plasma', 'liver', 'kidney', 'brain', 'heart', 'muscle', 'fat', 
                      'lung', 'spleen', 'gut', 'bone', 'skin', 'pancreas',
                      'adrenal', 'thyroid']:
+            if organ == 'plasma':  # Plasma has unit affinity
+                affinity[organ] = 1.0
             # Higher affinity for lipophilic tissues (fat, brain) for lipophilic drugs
-            if organ in ['fat', 'brain'] and self.log_p > 2:
+            elif organ in ['fat', 'brain'] and self.log_p > 2:
                 affinity[organ] = np.random.uniform(2.0, 5.0)
             elif organ in ['liver', 'kidney']:  # High metabolic/elimination organs
                 affinity[organ] = np.random.uniform(1.5, 3.0)
@@ -100,10 +102,12 @@ class DrugProperties:
     def _generate_metabolic_rate(self) -> Dict[str, float]:
         """Generate organ-specific metabolic rates"""
         metabolic_rate = {}
-        for organ in ['liver', 'kidney', 'brain', 'heart', 'muscle', 'fat', 
+        for organ in ['plasma', 'liver', 'kidney', 'brain', 'heart', 'muscle', 'fat', 
                      'lung', 'spleen', 'gut', 'bone', 'skin', 'pancreas',
                      'adrenal', 'thyroid']:
-            if organ == 'liver':  # Primary metabolic organ
+            if organ == 'plasma':  # No metabolism in plasma
+                metabolic_rate[organ] = 0.0
+            elif organ == 'liver':  # Primary metabolic organ
                 metabolic_rate[organ] = np.random.uniform(0.1, 2.0)
             elif organ == 'kidney':  # Secondary elimination
                 metabolic_rate[organ] = np.random.uniform(0.01, 0.5)
@@ -145,56 +149,72 @@ class SyntheticDataGenerator:
         """Simulate drug concentration-time profiles using simplified PBPK model"""
         
         def pbpk_ode(y, t, drug_props, graph):
-            """ODE system for PBPK model"""
-            concentrations = y.reshape(-1, 1)
+            """ODE system for PBPK model - simplified and more stable"""
+            concentrations = np.maximum(y, 0.0)  # Ensure non-negative
             dydt = np.zeros_like(concentrations)
             
             for i, organ in enumerate(graph.organs):
-                # Inflow from connected organs
-                inflow = 0
-                for j, connected_organ in enumerate(graph.organs):
-                    if graph.adjacency_matrix[j, i] == 1:
-                        flow_rate = graph.blood_flows[connected_organ]
-                        inflow += flow_rate * concentrations[j] * drug_props.fu_plasma
-                
-                # Outflow to connected organs
-                outflow = 0
-                for j, connected_organ in enumerate(graph.organs):
-                    if graph.adjacency_matrix[i, j] == 1:
-                        flow_rate = graph.blood_flows[organ]
-                        outflow += flow_rate * concentrations[i] * drug_props.fu_plasma
-                
-                # Metabolism/elimination
-                if organ == 'liver':
-                    metabolism = drug_props.metabolic_rate[organ] * concentrations[i]
-                elif organ == 'kidney':
-                    metabolism = drug_props.metabolic_rate[organ] * concentrations[i]
+                # Simplified flow model - only plasma exchanges with other organs
+                if organ == 'plasma':
+                    # Plasma receives from all organs and distributes to all organs
+                    total_inflow = 0
+                    total_outflow = 0
+                    
+                    for j, other_organ in enumerate(graph.organs):
+                        if j != i:  # Not plasma itself
+                            # Flow from other organs to plasma
+                            flow_rate = graph.blood_flows[other_organ] * 0.1  # Reduced flow rate
+                            total_inflow += flow_rate * concentrations[j] * drug_props.fu_plasma
+                            
+                            # Flow from plasma to other organs
+                            total_outflow += flow_rate * concentrations[i] * drug_props.fu_plasma
+                    
+                    # Clearance from plasma
+                    clearance = drug_props.clearance * concentrations[i]
+                    
+                    dydt[i] = (total_inflow - total_outflow - clearance) / graph.volumes[organ]
+                    
                 else:
-                    metabolism = drug_props.metabolic_rate[organ] * concentrations[i]
-                
-                # Tissue distribution
-                if organ != 'plasma':
-                    tissue_affinity = drug_props.tissue_affinity[organ]
-                    distribution = tissue_affinity * (concentrations[0] - concentrations[i])  # plasma -> tissue
-                else:
-                    distribution = 0
-                
-                # Rate of change
-                dydt[i] = (inflow - outflow - metabolism + distribution) / graph.volumes[organ]
+                    # Other organs: simple exchange with plasma
+                    plasma_idx = 0
+                    flow_rate = graph.blood_flows[organ] * 0.1  # Reduced flow rate
+                    
+                    # Flow from plasma to organ
+                    inflow = flow_rate * concentrations[plasma_idx] * drug_props.fu_plasma
+                    
+                    # Flow from organ to plasma
+                    outflow = flow_rate * concentrations[i] * drug_props.fu_plasma
+                    
+                    # Tissue-specific metabolism (reduced)
+                    metabolism = drug_props.metabolic_rate[organ] * concentrations[i] * 0.1
+                    
+                    dydt[i] = (inflow - outflow - metabolism) / graph.volumes[organ]
             
-            return dydt.flatten()
+            return dydt
         
         # Initial conditions (dose in plasma)
         initial_dose = 100.0  # mg/kg
         y0 = np.zeros(len(self.graph.organs))
         y0[0] = initial_dose / self.graph.volumes['plasma']  # Initial plasma concentration
         
-        # Solve ODE system
-        solution = odeint(pbpk_ode, y0, self.time_points, args=(drug_props, self.graph))
+        # Solve ODE system with better numerical stability
+        try:
+            solution = odeint(pbpk_ode, y0, self.time_points, args=(drug_props, self.graph), 
+                            rtol=1e-6, atol=1e-8, mxstep=10000)
+        except:
+            # Fallback with simpler solver settings
+            solution = odeint(pbpk_ode, y0, self.time_points, args=(drug_props, self.graph), 
+                            rtol=1e-3, atol=1e-5)
         
-        # Add realistic noise
-        noise_level = 0.1
-        solution += np.random.normal(0, noise_level * np.mean(solution), solution.shape)
+        # Ensure non-negative concentrations (physically realistic)
+        solution = np.maximum(solution, 0.0)
+        
+        # Add realistic noise only if solution is valid
+        if np.any(solution > 0):
+            noise_level = 0.1
+            mean_conc = np.mean(solution[solution > 0])  # Only use positive concentrations
+            noise = np.random.normal(0, noise_level * mean_conc, solution.shape)
+            solution = np.maximum(solution + noise, 0.0)  # Ensure non-negative after noise
         
         return solution
     

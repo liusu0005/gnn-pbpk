@@ -12,7 +12,11 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Set style
-plt.style.use('seaborn')
+# Use a modern matplotlib style
+plt.style.use('default')
+plt.rcParams['figure.facecolor'] = 'white'
+plt.rcParams['axes.facecolor'] = 'white'
+plt.rcParams['font.size'] = 10
 sns.set_palette("husl")
 
 class ResultsVisualizer:

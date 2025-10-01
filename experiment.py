@@ -11,6 +11,7 @@ from torch_geometric.data import DataLoader
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
+from scipy import stats
 from sklearn.model_selection import train_test_split
 import warnings
 warnings.filterwarnings('ignore')
@@ -66,16 +67,34 @@ class ExperimentRunner:
             self.concentrations, self.graph_features, drug_ids
         )
         
-        # Split data
-        train_data, test_data = train_test_split(gnn_data, test_size=0.3, random_state=self.random_seed)
-        train_data, val_data = train_test_split(train_data, test_size=0.2, random_state=self.random_seed)
+        # Split data into exact 70%/15%/15%
+        total_indices = np.arange(len(gnn_data))
+        # First hold out 15% for test
+        trainval_indices, test_indices = train_test_split(
+            total_indices, test_size=0.15, random_state=self.random_seed, shuffle=True
+        )
+        # From remaining 85%, hold out 15% of total for val => 0.15/0.85
+        val_frac_of_trainval = 0.15 / 0.85
+        train_indices, val_indices = train_test_split(
+            trainval_indices, test_size=val_frac_of_trainval, random_state=self.random_seed, shuffle=True
+        )
+
+        # Persist indices for metric computation
+        self.train_indices = np.sort(train_indices)
+        self.val_indices = np.sort(val_indices)
+        self.test_indices = np.sort(test_indices)
+
+        # Materialize datasets
+        train_data = [gnn_data[i] for i in self.train_indices]
+        val_data = [gnn_data[i] for i in self.val_indices]
+        test_data = [gnn_data[i] for i in self.test_indices]
         
         # Create data loaders
         self.train_loader = DataLoader(train_data, batch_size=4, shuffle=True)
         self.val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
         self.test_loader = DataLoader(test_data, batch_size=4, shuffle=False)
         
-        print(f"Data split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
+        print(f"Data split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test (target 70/15/15)")
         
         return train_data, val_data, test_data
     
@@ -172,7 +191,7 @@ class ExperimentRunner:
                     edge_attr=batch.edge_attr,
                     drug_id=batch.drug_id,
                     initial_concentrations=batch.initial_concentrations,
-                    time_steps=batch.sequence_length
+                    time_steps=batch.time_steps
                 )
                 
                 # Convert to numpy and store
@@ -187,11 +206,12 @@ class ExperimentRunner:
         """Compute performance metrics for all models"""
         print("Computing performance metrics...")
         
-        # Get test data
-        test_indices = range(int(0.7 * self.n_drugs), self.n_drugs)
-        test_concentrations = self.concentrations[test_indices]
-        test_traditional = self.traditional_predictions[test_indices]
-        test_ensemble = self.ensemble_predictions[test_indices]
+        # Get test data using stored indices from the split (exact 15%)
+        if not hasattr(self, 'test_indices'):
+            raise RuntimeError('Test indices not found. Call prepare_gnn_data() before compute_metrics().')
+        test_concentrations = self.concentrations[self.test_indices]
+        test_traditional = self.traditional_predictions[self.test_indices]
+        test_ensemble = self.ensemble_predictions[self.test_indices]
         
         # Ensure GNN predictions match test data shape
         if hasattr(self, 'gnn_predictions'):
@@ -207,6 +227,7 @@ class ExperimentRunner:
         }
         
         metrics = {}
+        per_drug_errors = {}
         
         for model_name, predictions in models.items():
             # Flatten for overall metrics
@@ -247,9 +268,80 @@ class ExperimentRunner:
                 'overall': model_metrics,
                 'organs': organ_metrics
             }
+
+            # Per-drug MAE and MAPE for statistical testing
+            n_drugs_test = predictions.shape[0]
+            model_mae = []
+            model_mape = []
+            for d in range(n_drugs_test):
+                true_d = test_concentrations[d].flatten()
+                pred_d = predictions[d].flatten()
+                mask_d = true_d > 0
+                mae_d = np.mean(np.abs(true_d - pred_d))
+                mape_d = mean_absolute_percentage_error(true_d[mask_d], pred_d[mask_d]) * 100 if mask_d.any() else np.nan
+                model_mae.append(mae_d)
+                model_mape.append(mape_d)
+            per_drug_errors[model_name] = {
+                'MAE': np.array(model_mae),
+                'MAPE': np.array(model_mape)
+            }
         
         self.metrics = metrics
+        self.per_drug_errors = per_drug_errors
         return metrics
+
+    def statistical_significance(self):
+        """Run paired significance tests between GNN-PBPK and baselines on per-drug errors."""
+        if not hasattr(self, 'per_drug_errors'):
+            raise RuntimeError('Compute metrics before statistical tests.')
+
+        results = {}
+        gnn_mae = self.per_drug_errors['GNN-PBPK']['MAE']
+        gnn_mape = self.per_drug_errors['GNN-PBPK']['MAPE']
+
+        for baseline in ['Traditional PBPK', 'Ensemble PBPK']:
+            base_mae = self.per_drug_errors[baseline]['MAE']
+            base_mape = self.per_drug_errors[baseline]['MAPE']
+
+            # Align and drop NaNs for MAPE
+            valid_mask = ~np.isnan(gnn_mape) & ~np.isnan(base_mape)
+            g_mape = gnn_mape[valid_mask]
+            b_mape = base_mape[valid_mask]
+
+            # Paired t-test and Wilcoxon on MAE and MAPE (lower is better)
+            t_mae = stats.ttest_rel(base_mae, gnn_mae, alternative='greater')
+            w_mae = stats.wilcoxon(base_mae, gnn_mae, alternative='greater')
+            t_mape = stats.ttest_rel(b_mape, g_mape, alternative='greater') if len(g_mape) > 0 else None
+            w_mape = stats.wilcoxon(b_mape, g_mape, alternative='greater') if len(g_mape) > 0 else None
+
+            # Bootstrap CI for improvement in MAPE
+            def bootstrap_ci(diff, n_boot=5000, alpha=0.05):
+                if len(diff) == 0:
+                    return (np.nan, np.nan, np.nan)
+                rng = np.random.default_rng(self.random_seed)
+                boots = []
+                for _ in range(n_boot):
+                    idx = rng.integers(0, len(diff), len(diff))
+                    boots.append(np.mean(diff[idx]))
+                boots = np.sort(boots)
+                lower = boots[int((alpha/2) * n_boot)]
+                upper = boots[int((1 - alpha/2) * n_boot) - 1]
+                return (np.mean(diff), lower, upper)
+
+            mape_improvement = (b_mape - g_mape)  # positive means GNN better
+            mape_improve_mean, mape_ci_lo, mape_ci_hi = bootstrap_ci(mape_improvement)
+
+            results[baseline] = {
+                'paired_t_MAE_p': float(t_mae.pvalue),
+                'wilcoxon_MAE_p': float(w_mae.pvalue),
+                'paired_t_MAPE_p': float(t_mape.pvalue) if t_mape is not None else np.nan,
+                'wilcoxon_MAPE_p': float(w_mape.pvalue) if w_mape is not None else np.nan,
+                'MAPE_improvement_mean_pct': float(mape_improve_mean),
+                'MAPE_improvement_CI95_pct': (float(mape_ci_lo), float(mape_ci_hi))
+            }
+
+        self.significance_results = results
+        return results
     
     def generate_results_summary(self):
         """Generate comprehensive results summary"""
@@ -286,6 +378,9 @@ class ExperimentRunner:
         trad_mape = self.metrics['Traditional PBPK']['overall']['MAPE']
         improvement = ((trad_mape - gnn_mape) / trad_mape) * 100
         
+        # Significance (if available)
+        sig = getattr(self, 'significance_results', {})
+
         summary = {
             'overall_performance': overall_df,
             'organ_performance': organ_df,
@@ -294,7 +389,8 @@ class ExperimentRunner:
                 'GNN MAPE': gnn_mape,
                 'Traditional MAPE': trad_mape,
                 'Improvement': improvement
-            }
+            },
+            'significance': sig
         }
         
         self.results_summary = summary
@@ -323,6 +419,8 @@ class ExperimentRunner:
         
         # Step 6: Compute metrics
         self.compute_metrics()
+        # Step 6b: Statistical significance
+        self.statistical_significance()
         
         # Step 7: Generate summary
         self.generate_results_summary()
