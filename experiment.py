@@ -1,425 +1,381 @@
+#!/usr/bin/env python3
 """
-Main Experiment Script for GNN-PBPK vs Traditional PBPK Comparison
-Now includes saving/loading of trained GNN model and cached PBPK predictions
+Experiment runner using the fixed data generator
 """
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
-from torch_geometric.data import DataLoader
-import matplotlib.pyplot as plt
-import seaborn as sns
+import torch.optim as optim
+from torch_geometric.data import Data, DataLoader
+import pandas as pd
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
 from scipy import stats
-from sklearn.model_selection import train_test_split
-import warnings, os, json
-warnings.filterwarnings('ignore')
+import json
+import os
+from typing import Dict, List, Tuple, Any
 
-# Import our custom modules
-from data_generator import SyntheticDataGenerator, PhysiologicalGraph
-from gnn_pbpk_model import DynamicGNNPBPK, GNNPBPKTrainer, create_physiological_graph_data
-from traditional_pbpk import TraditionalPBPK, PBPKEnsemble, create_standard_physiological_parameters, DrugParameters
-
+# Import our modules
+from data_generator import SyntheticDataGenerator, DrugProperties
+from gnn_pbpk_model import DynamicGNNPBPK, PhysiologicalGNN, GNNPBPKTrainer, create_physiological_graph_data
+from traditional_pbpk import TraditionalPBPK, PBPKEnsemble, PhysiologicalParameters, DrugParameters
 
 class ExperimentRunner:
-    """
-    Main experiment runner for comparing GNN-PBPK vs Traditional PBPK
-    """
-
-    def __init__(self, n_drugs: int = 50, random_seed: int = 42):
+    """Experiment runner for GNN-PBPK model"""
+    
+    def __init__(self, n_drugs: int = 30, n_epochs: int = 100, force_retrain: bool = False):
         self.n_drugs = n_drugs
-        self.random_seed = random_seed
-        np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
-
-        # Initialize components
+        self.n_epochs = n_epochs
+        self.force_retrain = force_retrain
+        
+        # Initialize data generator
         self.data_generator = SyntheticDataGenerator()
-        self.physio_params = create_standard_physiological_parameters()
-        self.traditional_pbpk = TraditionalPBPK(self.physio_params)
-        self.ensemble_pbpk = PBPKEnsemble(self.physio_params, n_models=5)
-
-        # Results storage
+        
+        # Data storage
+        self.concentrations = None
+        self.graph_features = None
+        self.drug_properties = None
+        
+        # Model storage
+        self.gnn_model = None
+        self.gnn_trainer = None
+        self.traditional_model = None
+        self.ensemble_model = None
+        
+        # Data loaders
+        self.train_loader = None
+        self.val_loader = None
+        self.test_loader = None
+        
+        # Results
         self.results = {}
-
-    # ------------------------------
-    # Dataset preparation
-    # ------------------------------
-    def generate_dataset(self):
+        
+    def generate_data(self):
+        """Generate synthetic dataset"""
         print("Generating synthetic dataset...")
-        concentrations, graph_features, drug_properties = self.data_generator.generate_drug_dataset(self.n_drugs)
-
-        self.concentrations = concentrations
-        self.graph_features = graph_features
-        self.drug_properties = drug_properties
-        self.time_points = self.data_generator.time_points
-
-        print(f"Dataset generated: {concentrations.shape}")
-        return concentrations, graph_features, drug_properties
-
+        
+        self.concentrations, self.graph_features, self.drug_properties = \
+            self.data_generator.generate_drug_dataset(n_drugs=self.n_drugs)
+        
+        print(f"Dataset generated: {self.concentrations.shape}")
+        print(f"Concentration range: [{self.concentrations.min():.3f}, {self.concentrations.max():.3f}]")
+        print(f"Concentration mean: {self.concentrations.mean():.3f}")
+        
+        return self.concentrations, self.graph_features, self.drug_properties
+    
+    def _convert_drug_properties(self, drug_props: DrugProperties) -> DrugParameters:
+        """Convert DrugProperties to DrugParameters for traditional PBPK models"""
+        return DrugParameters(
+            clearance=drug_props.clearance,
+            volume_distribution=1.0,  # Placeholder
+            fu_plasma=drug_props.fu_plasma,
+            molecular_weight=drug_props.molecular_weight,
+            log_p=drug_props.log_p,
+            tissue_affinity=drug_props.tissue_affinity,
+            metabolic_rate=drug_props.metabolic_rate,
+            transporter_mediated=False
+        )
+    
     def prepare_gnn_data(self):
+        """Prepare data for GNN training"""
         print("Preparing GNN data...")
-        drug_ids = np.arange(self.n_drugs)
-        gnn_data = create_physiological_graph_data(self.concentrations, self.graph_features, drug_ids)
-
-        # split 70/15/15
-        total_indices = np.arange(len(gnn_data))
-        trainval_indices, test_indices = train_test_split(
-            total_indices, test_size=0.15, random_state=self.random_seed, shuffle=True
-        )
-        val_frac = 0.15 / 0.85
-        train_indices, val_indices = train_test_split(
-            trainval_indices, test_size=val_frac, random_state=self.random_seed, shuffle=True
-        )
-
-        self.train_indices, self.val_indices, self.test_indices = np.sort(train_indices), np.sort(val_indices), np.sort(test_indices)
-
-        train_data = [gnn_data[i] for i in self.train_indices]
-        val_data = [gnn_data[i] for i in self.val_indices]
-        test_data = [gnn_data[i] for i in self.test_indices]
-
+        
+        # Create graph data for each drug
+        graph_data_list = []
+        
+        for i in range(self.n_drugs):
+            # Get drug-specific data
+            drug_concentrations = self.concentrations[i]  # Shape: (time_steps, num_organs)
+            drug_props = self.drug_properties[i]
+            drug_graph_features = self.graph_features[i]
+            
+            # Convert drug properties to tensor
+            drug_props_tensor = torch.tensor([
+                drug_props.molecular_weight,
+                drug_props.log_p,
+                drug_props.fu_plasma,
+                drug_props.clearance,
+                1.0  # volume_distribution (placeholder)
+            ], dtype=torch.float32)
+            
+            # Create graph data - need to reshape for the function
+            # The function expects (num_drugs, time_steps, num_organs), so we add a batch dimension
+            drug_concentrations_3d = drug_concentrations.reshape(1, drug_concentrations.shape[0], drug_concentrations.shape[1])
+            
+            graph_data = create_physiological_graph_data(
+                concentrations=drug_concentrations_3d,
+                drug_properties=[drug_props_tensor],  # List with single drug tensor
+                graph_features=drug_graph_features.reshape(1, -1)  # Add batch dimension
+            )
+            graph_data_list.append(graph_data[0])  # Extract the single graph data object
+        
+        print(f"Created {len(graph_data_list)} graph data objects")
+        
+        # Split data
+        n_train = int(0.7 * self.n_drugs)
+        n_val = int(0.15 * self.n_drugs)
+        n_test = self.n_drugs - n_train - n_val
+        
+        train_data = graph_data_list[:n_train]
+        val_data = graph_data_list[n_train:n_train + n_val]
+        test_data = graph_data_list[n_train + n_val:]
+        
+        print(f"Data split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
+        
+        # Create data loaders
         self.train_loader = DataLoader(train_data, batch_size=4, shuffle=True)
         self.val_loader = DataLoader(val_data, batch_size=4, shuffle=False)
         self.test_loader = DataLoader(test_data, batch_size=4, shuffle=False)
-
-        print(f"Data split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
+        
         return train_data, val_data, test_data
-
-    # ------------------------------
-    # GNN Training & Loading
-    # ------------------------------
-    def train_gnn_model(self, epochs: int = 100, model_path="gnn_pbpk_model.pt"):
-        print("Training GNN-PBPK model...")
+    
+    def initialize_models(self):
+        """Initialize all models"""
+        print("Initializing models...")
+        
+        # GNN model parameters
+        num_organs = len(self.data_generator.graph.organs)
+        time_steps = self.concentrations.shape[1]
+        drug_features_dim = 5  # molecular_weight, log_p, fu_plasma, clearance, volume_distribution
+        hidden_dim = 64
+        temporal_hidden = 32
+        
+        # Initialize GNN model
         self.gnn_model = DynamicGNNPBPK(
-            num_organs=15,
-            node_features=5,
-            edge_features=2,
-            hidden_dim=64,
-            num_heads=4,
-            num_layers=3,
-            temporal_hidden=128,
-            sequence_length=len(self.time_points)
+            num_organs=num_organs,
+            node_features=drug_features_dim,
+            edge_features=3,  # From the graph creation
+            hidden_dim=hidden_dim,
+            sequence_length=time_steps,
+            temporal_hidden=temporal_hidden
         )
-        self.gnn_trainer = GNNPBPKTrainer(self.gnn_model, learning_rate=0.001)
-
-        train_losses, val_losses = [], []
-        for epoch in range(epochs):
+        
+        # Initialize GNN trainer
+        self.gnn_trainer = GNNPBPKTrainer(
+            model=self.gnn_model,
+            learning_rate=0.001
+        )
+        
+        # Initialize traditional PBPK model
+        # Create physiological parameters
+        phys_params = PhysiologicalParameters(
+            organ_volumes={organ: self.data_generator.graph.volumes[organ] 
+                          for organ in self.data_generator.graph.organs},
+            blood_flows={organ: self.data_generator.graph.blood_flows[organ] 
+                        for organ in self.data_generator.graph.organs},
+            cardiac_output=5.0
+        )
+        
+        self.traditional_model = TraditionalPBPK(phys_params)
+        self.ensemble_model = PBPKEnsemble(phys_params, n_models=5)
+        
+        print(f"GNN model parameters: {sum(p.numel() for p in self.gnn_model.parameters()):,}")
+        
+    def train_gnn_model(self):
+        """Train the GNN model or load existing trained model"""
+        model_path = 'trained_gnn_model.pt'
+        
+        # Check if trained model already exists and force_retrain is False
+        if os.path.exists(model_path) and not self.force_retrain:
+            print(f"Loading existing trained model from {model_path}...")
+            try:
+                self.gnn_model.load_state_dict(torch.load(model_path))
+                print("✅ Successfully loaded trained model!")
+                return
+            except Exception as e:
+                print(f"❌ Failed to load model: {e}")
+                print("Training new model...")
+        elif self.force_retrain:
+            print("🔄 Force retrain enabled - training new model...")
+        
+        print(f"Training GNN model for {self.n_epochs} epochs...")
+        
+        best_val_loss = float('inf')
+        patience = 20
+        patience_counter = 0
+        
+        for epoch in range(self.n_epochs):
+            # Training
             train_loss = self.gnn_trainer.train_epoch(self.train_loader)
+            
+            # Validation
             val_loss = self.gnn_trainer.validate(self.val_loader)
-            train_losses.append(train_loss); val_losses.append(val_loss)
-
-            if epoch % 20 == 0:
-                print(f"Epoch {epoch}: Train {train_loss:.4f}, Val {val_loss:.4f}")
-
-        self.gnn_train_losses, self.gnn_val_losses = train_losses, val_losses
+            
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch:3d}: Train Loss = {train_loss:.6f}, Val Loss = {val_loss:.6f}")
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # Save best model
+                torch.save(self.gnn_model.state_dict(), 'best_gnn_model.pt')
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+        
+        # Load best model and save final trained model
+        self.gnn_model.load_state_dict(torch.load('best_gnn_model.pt'))
         torch.save(self.gnn_model.state_dict(), model_path)
-        print(f"GNN model saved to {model_path}")
-        return train_losses, val_losses
-
-    def load_gnn_model(self, model_path="gnn_pbpk_model.pt"):
-        print(f"Loading GNN model from {model_path}")
-        model = DynamicGNNPBPK(
-            num_organs=15,
-            node_features=5,
-            edge_features=2,
-            hidden_dim=64,
-            num_heads=4,
-            num_layers=3,
-            temporal_hidden=128,
-            sequence_length=len(self.time_points)
-        )
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
-        model.eval()
-        self.gnn_model = model
-
-    # ------------------------------
-    # Traditional PBPK
-    # ------------------------------
-    def evaluate_traditional_pbpk(self, force_recompute=False):
-        if (not force_recompute 
-            and os.path.exists("traditional_predictions.npy") 
-            and os.path.exists("ensemble_predictions.npy")):
-            print("Loading cached Traditional & Ensemble PBPK predictions...")
-            self.traditional_predictions = np.load("traditional_predictions.npy")
-            self.ensemble_predictions = np.load("ensemble_predictions.npy")
-            return self.traditional_predictions, self.ensemble_predictions
-
-        print("Evaluating Traditional PBPK model...")
-        traditional_predictions, ensemble_predictions = [], []
-        for drug_props in self.drug_properties:
-            drug_params = DrugParameters(
-                clearance=drug_props.clearance,
-                volume_distribution=drug_props.volume_distribution,
-                fu_plasma=drug_props.fu_plasma,
-                molecular_weight=drug_props.molecular_weight,
-                log_p=drug_props.log_p,
-                tissue_affinity=drug_props.tissue_affinity,
-                metabolic_rate=drug_props.metabolic_rate,
-                transporter_mediated=drug_props.transporter_mediated
-            )
-            trad_pred = self.traditional_pbpk.simulate_drug_kinetics(drug_params, time_points=self.time_points)
-            trad_pred = np.expand_dims(trad_pred, axis=-1)  # ensure [time, 1]
-            traditional_predictions.append(trad_pred)
-
-            ensemble_mean, _ = self.ensemble_pbpk.predict(drug_params, time_points=self.time_points)
-            ensemble_mean = np.expand_dims(ensemble_mean, axis=-1)
-            ensemble_predictions.append(ensemble_mean)
-
-        self.traditional_predictions = np.array(traditional_predictions)
-        self.ensemble_predictions = np.array(ensemble_predictions)
-
-        np.save("traditional_predictions.npy", self.traditional_predictions)
-        np.save("ensemble_predictions.npy", self.ensemble_predictions)
-        print("Saved Traditional & Ensemble PBPK predictions to .npy files")
-        return self.traditional_predictions, self.ensemble_predictions
-
-    # ------------------------------
-    # GNN Evaluation
-    # ------------------------------
-    def evaluate_gnn_model(self):
-        print("Evaluating GNN-PBPK model...")
-        self.gnn_model.eval()
+        print(f"✅ Training completed! Model saved to {model_path}")
+        
+    def evaluate_models(self):
+        """Evaluate all models on test data"""
+        print("Evaluating models...")
+        
+        # Get test data
+        test_concentrations = self.concentrations[-len(self.test_loader.dataset):]
+        
+        # Evaluate GNN model
         gnn_predictions = []
-
-        max_time = self.concentrations.shape[1]   # use dataset’s max time length
-        target_organs = self.concentrations.shape[2]
-
+        self.gnn_model.eval()
+        
         with torch.no_grad():
             for batch in self.test_loader:
-                pred = self.gnn_model(
-                    node_features=batch.node_features,
-                    edge_index=batch.edge_index,
-                    edge_attr=batch.edge_attr,
-                    drug_id=batch.drug_id,
-                    initial_concentrations=batch.initial_concentrations,
-                    time_steps=batch.time_steps
+                predictions = self.gnn_model(
+                    batch.node_features,
+                    batch.edge_index,
+                    batch.edge_attr,
+                    batch.drug_id,
+                    batch.initial_concentrations,
+                    batch.time_steps
                 )
-                pred_np = pred.cpu().numpy()
-
-                # Ensure consistent shape: [time_steps, num_organs]
-                if pred_np.ndim == 3:
-                    # [time_steps, num_organs, 1] -> [time_steps, num_organs]
-                    pred_np = pred_np.squeeze(axis=-1)
-                elif pred_np.ndim == 1:
-                    # [time_steps] -> [time_steps, 1] (single organ)
-                    pred_np = pred_np[:, np.newaxis]
+                # Reshape predictions to [batch_size, time_steps, num_organs]
+                batch_size = len(torch.unique(batch.batch)) if hasattr(batch, 'batch') else 1
+                time_steps = predictions.size(0)
+                num_organs = 15
                 
-                # Ensure we have the right dimensions
-                if pred_np.ndim != 2:
-                    print(f"Warning: Unexpected prediction shape {pred_np.shape}, reshaping...")
-                    pred_np = pred_np.reshape(-1, 1)
-                
-                # Pad to match expected dimensions
-                if pred_np.shape[0] < max_time:
-                    pad_t = max_time - pred_np.shape[0]
-                    pred_np = np.pad(pred_np, ((0, pad_t), (0, 0)), mode="constant")
-                
-                if pred_np.shape[1] < target_organs:
-                    pad_o = target_organs - pred_np.shape[1]
-                    pred_np = np.pad(pred_np, ((0, 0), (0, pad_o)), mode="constant")
-                elif pred_np.shape[1] > target_organs:
-                    # Truncate if too many organs
-                    pred_np = pred_np[:, :target_organs]
-
-                gnn_predictions.append(pred_np)
-
-        self.gnn_predictions = np.stack(gnn_predictions, axis=0)
-        print("Final GNN predictions shape:", self.gnn_predictions.shape)
-        return self.gnn_predictions
-
-
-
-    # ------------------------------
-    # Metrics & Summary (unchanged except shape fixes)
-    # ------------------------------
-    def compute_metrics(self):
-        print("Computing performance metrics...")
-        if not hasattr(self, 'test_indices'):
-            raise RuntimeError("Need prepare_gnn_data() first")
-
-        test_concentrations = self.concentrations[self.test_indices]
-        test_traditional = self.traditional_predictions[self.test_indices]
-        test_ensemble = self.ensemble_predictions[self.test_indices]
-        test_gnn = getattr(self, "gnn_predictions", test_traditional)
+                # Reshape from [time_steps, batch_size * num_organs, 1] to [batch_size, time_steps, num_organs]
+                pred_reshaped = predictions.squeeze(-1).view(time_steps, batch_size, num_organs).permute(1, 0, 2)
+                gnn_predictions.append(pred_reshaped.cpu().numpy())
         
-        # Ensure all predictions have the same shape
-        print(f"Shapes - True: {test_concentrations.shape}, Traditional: {test_traditional.shape}, GNN: {test_gnn.shape}")
+        gnn_predictions = np.concatenate(gnn_predictions, axis=0)
         
-        # If GNN predictions have different shape, adjust them
-        if test_gnn.shape != test_concentrations.shape:
-            print(f"Adjusting GNN predictions from {test_gnn.shape} to {test_concentrations.shape}")
-            # For now, use traditional predictions as fallback for GNN
-            test_gnn = test_traditional.copy()
-
-        models = {
-            "Traditional PBPK": test_traditional,
-            "Ensemble PBPK": test_ensemble,
-            "GNN-PBPK": test_gnn
-        }
-
-        metrics, per_drug_errors = {}, {}
-        organs = ['plasma','liver','kidney','brain','heart','muscle','fat','lung',
-                  'spleen','gut','bone','skin','pancreas','adrenal','thyroid']
-
-        for model_name, predictions in models.items():
-            y_true = test_concentrations.flatten()
-            y_pred = predictions.flatten()
-            mask = y_true > 0
-            y_true_masked, y_pred_masked = y_true[mask], y_pred[mask]
-
-            model_metrics = {
-                'MAPE': mean_absolute_percentage_error(y_true_masked, y_pred_masked) * 100,
-                'RMSE': np.sqrt(mean_squared_error(y_true, y_pred)),
-                'R2': r2_score(y_true, y_pred),
-                'MAE': np.mean(np.abs(y_true - y_pred))
+        # Evaluate traditional PBPK model
+        traditional_predictions = []
+        for i in range(len(test_concentrations)):
+            drug_props = self.drug_properties[-len(test_concentrations) + i]
+            drug_params = self._convert_drug_properties(drug_props)
+            pred = self.traditional_model.simulate_drug_kinetics(
+                drug_params=drug_params,
+                time_points=self.data_generator.time_points
+            )
+            traditional_predictions.append(pred)
+        
+        traditional_predictions = np.array(traditional_predictions)
+        
+        # Evaluate ensemble model
+        ensemble_predictions = []
+        for i in range(len(test_concentrations)):
+            drug_props = self.drug_properties[-len(test_concentrations) + i]
+            drug_params = self._convert_drug_properties(drug_props)
+            pred, _ = self.ensemble_model.predict(
+                drug_params=drug_params,
+                time_points=self.data_generator.time_points
+            )
+            ensemble_predictions.append(pred)
+        
+        ensemble_predictions = np.array(ensemble_predictions)
+        
+        # Compute metrics
+        metrics = self.compute_metrics(
+            test_concentrations, 
+            gnn_predictions, 
+            traditional_predictions, 
+            ensemble_predictions
+        )
+        
+        self.results = {
+            'metrics': metrics,
+            'experiment_info': {
+                'n_drugs': self.n_drugs,
+                'n_epochs': self.n_epochs,
+                'concentration_range': [float(self.concentrations.min()), float(self.concentrations.max())],
+                'concentration_mean': float(self.concentrations.mean()),
+                'dataset_shape': list(self.concentrations.shape),
+                'timestamp': str(pd.Timestamp.now())
             }
-            organ_metrics = {}
-            for i, organ in enumerate(organs):
-                if i < test_concentrations.shape[2]:
-                    org_true = test_concentrations[:, :, i].flatten()
-                    org_pred = predictions[:, :, i].flatten()
-                    mask = org_true > 0
-                    if mask.sum() > 0:
-                        organ_metrics[organ] = {
-                            "MAPE": mean_absolute_percentage_error(org_true[mask], org_pred[mask]) * 100,
-                            "R2": r2_score(org_true, org_pred)
-                        }
-
-            metrics[model_name] = {"overall": model_metrics, "organs": organ_metrics}
-
-            # per-drug metrics
-            n_drugs_test = predictions.shape[0]
-            model_mae, model_mape = [], []
-            for d in range(n_drugs_test):
-                true_d = test_concentrations[d].flatten()
-                pred_d = predictions[d].flatten()
-                mask_d = true_d > 0
-                mae_d = np.mean(np.abs(true_d - pred_d))
-                mape_d = mean_absolute_percentage_error(true_d[mask_d], pred_d[mask_d]) * 100 if mask_d.any() else np.nan
-                model_mae.append(mae_d); model_mape.append(mape_d)
-            per_drug_errors[model_name] = {"MAE": np.array(model_mae), "MAPE": np.array(model_mape)}
-
-        self.metrics, self.per_drug_errors = metrics, per_drug_errors
+        }
+        
         return metrics
-
-    def statistical_significance(self):
-        """Run paired significance tests between GNN-PBPK and baselines on per-drug errors."""
-        if not hasattr(self, 'per_drug_errors'):
-            raise RuntimeError('Compute metrics before statistical tests.')
-        
-        results = {}
-        baselines = ['Traditional PBPK', 'Ensemble PBPK']
-        
-        for baseline in baselines:
-            if baseline not in self.per_drug_errors:
-                continue
-                
-            base_mae = self.per_drug_errors[baseline]['MAE']
-            gnn_mae = self.per_drug_errors['GNN-PBPK']['MAE']
-            b_mape = self.per_drug_errors[baseline]['MAPE']
-            g_mape = self.per_drug_errors['GNN-PBPK']['MAPE']
-            
-            # Remove NaN values
-            valid_mape = ~(np.isnan(b_mape) | np.isnan(g_mape))
-            b_mape = b_mape[valid_mape]
-            g_mape = g_mape[valid_mape]
-            
-            # Paired t-test and Wilcoxon on MAE and MAPE (lower is better)
-            t_mae = stats.ttest_rel(base_mae, gnn_mae, alternative='greater')
-            w_mae = stats.wilcoxon(base_mae, gnn_mae, alternative='greater')
-            t_mape = stats.ttest_rel(b_mape, g_mape, alternative='greater') if len(g_mape) > 0 else None
-            w_mape = stats.wilcoxon(b_mape, g_mape, alternative='greater') if len(g_mape) > 0 else None
-            
-            # Bootstrap CI for improvement in MAPE
-            def bootstrap_ci(diff, n_boot=5000, alpha=0.05):
-                if len(diff) == 0:
-                    return (np.nan, np.nan, np.nan)
-                rng = np.random.default_rng(self.random_seed)
-                boot_means = []
-                for _ in range(n_boot):
-                    boot_sample = rng.choice(diff, size=len(diff), replace=True)
-                    boot_means.append(np.mean(boot_sample))
-                boot_means = np.array(boot_means)
-                ci_low = np.percentile(boot_means, 100 * alpha / 2)
-                ci_high = np.percentile(boot_means, 100 * (1 - alpha / 2))
-                return (np.mean(diff), ci_low, ci_high)
-            
-            mape_improvement = (b_mape - g_mape)  # positive means GNN better
-            mape_improve_mean, mape_ci_lo, mape_ci_hi = bootstrap_ci(mape_improvement)
-            
-            results[baseline] = {
-                'paired_t_MAE_p': float(t_mae.pvalue),
-                'wilcoxon_MAE_p': float(w_mae.pvalue),
-                'paired_t_MAPE_p': float(t_mape.pvalue) if t_mape is not None else np.nan,
-                'wilcoxon_MAPE_p': float(w_mape.pvalue) if w_mape is not None else np.nan,
-                'MAPE_improvement_mean_pct': float(mape_improve_mean),
-                'MAPE_improvement_CI95_pct': (float(mape_ci_lo), float(mape_ci_hi))
-            }
-        
-        self.significance_results = results
-        return results
     
-    def generate_results_summary(self):
-        """Generate comprehensive results summary"""
-        # Overall performance DataFrame
-        overall_data = []
-        for model_name, metrics in self.metrics.items():
-            overall_data.append({
-                'Model': model_name,
-                'MAPE (%)': metrics['overall']['MAPE'],
-                'RMSE': metrics['overall']['RMSE'],
-                'R²': metrics['overall']['R2'],
-                'MAE': metrics['overall']['MAE']
-            })
-        overall_df = pd.DataFrame(overall_data)
+    def compute_metrics(self, true, gnn_pred, traditional_pred, ensemble_pred):
+        """Compute evaluation metrics"""
+        # Flatten data for metric computation
+        true_flat = true.flatten()
+        gnn_flat = gnn_pred.flatten()
+        traditional_flat = traditional_pred.flatten()
+        ensemble_flat = ensemble_pred.flatten()
         
-        # Organ-specific performance
-        organ_results = []
-        for model_name, metrics in self.metrics.items():
-            for organ, organ_metrics in metrics['organs'].items():
-                organ_results.append({
-                    'Model': model_name,
-                    'Organ': organ,
-                    'MAPE (%)': organ_metrics['MAPE'],
-                    'R²': organ_metrics['R2']
-                })
+        # Remove any NaN or infinite values
+        mask = np.isfinite(true_flat) & np.isfinite(gnn_flat) & np.isfinite(traditional_flat) & np.isfinite(ensemble_flat)
+        true_flat = true_flat[mask]
+        gnn_flat = gnn_flat[mask]
+        traditional_flat = traditional_flat[mask]
+        ensemble_flat = ensemble_flat[mask]
         
-        organ_df = pd.DataFrame(organ_results)
+        # Compute metrics
+        def safe_mape(y_true, y_pred):
+            """Safe MAPE computation avoiding division by zero"""
+            mask = y_true > 1e-6  # Avoid division by very small numbers
+            if np.sum(mask) == 0:
+                return 100.0
+            return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
         
-        # Performance improvement analysis
-        gnn_mape = self.metrics['GNN-PBPK']['overall']['MAPE']
-        trad_mape = self.metrics['Traditional PBPK']['overall']['MAPE']
-        improvement = ((trad_mape - gnn_mape) / trad_mape) * 100
-        
-        # Significance (if available)
-        sig = getattr(self, 'significance_results', {})
-
-        summary = {
-            'overall_performance': overall_df,
-            'organ_performance': organ_df,
-            'improvement_percentage': improvement,
-            'gnn_vs_traditional': {
-                'GNN MAPE': gnn_mape,
-                'Traditional MAPE': trad_mape,
-                'Improvement': improvement
+        metrics = {
+            'gnn': {
+                'mape': safe_mape(true_flat, gnn_flat),
+                'rmse': np.sqrt(mean_squared_error(true_flat, gnn_flat)),
+                'r2': r2_score(true_flat, gnn_flat),
+                'mae': np.mean(np.abs(true_flat - gnn_flat))
             },
-            'significance': sig
+            'traditional': {
+                'mape': safe_mape(true_flat, traditional_flat),
+                'rmse': np.sqrt(mean_squared_error(true_flat, traditional_flat)),
+                'r2': r2_score(true_flat, traditional_flat),
+                'mae': np.mean(np.abs(true_flat - traditional_flat))
+            },
+            'ensemble': {
+                'mape': safe_mape(true_flat, ensemble_flat),
+                'rmse': np.sqrt(mean_squared_error(true_flat, ensemble_flat)),
+                'r2': r2_score(true_flat, ensemble_flat),
+                'mae': np.mean(np.abs(true_flat - ensemble_flat))
+            }
         }
         
-        self.results_summary = summary
+        # Statistical significance testing
+        gnn_errors = np.abs(true_flat - gnn_flat)
+        traditional_errors = np.abs(true_flat - traditional_flat)
         
-        # Save results to file
-        self.save_results_to_file()
+        # Paired t-test
+        t_stat, t_pvalue = stats.ttest_rel(traditional_errors, gnn_errors)
         
-        return summary
+        # Wilcoxon signed-rank test
+        w_stat, w_pvalue = stats.wilcoxon(traditional_errors, gnn_errors)
+        
+        # MAPE improvement
+        mape_improvement = metrics['traditional']['mape'] - metrics['gnn']['mape']
+        mape_improvement_pct = (mape_improvement / metrics['traditional']['mape']) * 100
+        
+        metrics['statistical_tests'] = {
+            'paired_t_test': {'statistic': float(t_stat), 'p_value': float(t_pvalue)},
+            'wilcoxon_test': {'statistic': float(w_stat), 'p_value': float(w_pvalue)},
+            'mape_improvement': float(mape_improvement),
+            'mape_improvement_pct': float(mape_improvement_pct)
+        }
+        
+        return metrics
     
-    def save_results_to_file(self):
-        """Save results to JSON file for visualization"""
-        # Convert numpy arrays and DataFrames to lists for JSON serialization
+    def save_results(self, filename: str = 'experiment_results.json'):
+        """Save results to JSON file"""
+        print(f"Saving results to {filename}...")
+        
+        # Convert numpy arrays to lists for JSON serialization
         def convert_numpy(obj):
-            if isinstance(obj, pd.DataFrame):
-                return obj.to_dict('records')
-            elif isinstance(obj, np.ndarray):
+            if isinstance(obj, np.ndarray):
                 return obj.tolist()
             elif isinstance(obj, np.integer):
                 return int(obj)
@@ -432,65 +388,121 @@ class ExperimentRunner:
             else:
                 return obj
         
-        # Prepare results for saving
-        results_to_save = convert_numpy(self.results_summary)
+        results_to_save = convert_numpy(self.results)
         
-        # Add metadata
-        results_to_save['metadata'] = {
-            'experiment_date': pd.Timestamp.now().isoformat(),
-            'num_drugs': len(self.test_indices),
-            'num_organs': 15,
-            'time_steps': 96,
-            'train_size': len(self.train_indices),
-            'val_size': len(self.val_indices),
-            'test_size': len(self.test_indices)
-        }
-        
-        # Save to JSON file
-        with open('experiment_results.json', 'w') as f:
+        with open(filename, 'w') as f:
             json.dump(results_to_save, f, indent=2)
         
-        print(f"Results saved to experiment_results.json")
-
-    # ------------------------------
-    # Run Full Experiment
-    # ------------------------------
-    def run_full_experiment(self):
+        print(f"Results saved to {filename}")
+    
+    def print_results(self):
+        """Print experiment results"""
+        if not self.results:
+            print("No results available. Run evaluate_models() first.")
+            return
+        
+        metrics = self.results['metrics']
+        
+        print("\n" + "="*60)
+        print("EXPERIMENT RESULTS")
         print("="*60)
-        print("DYNAMIC GNN-PBPK vs TRADITIONAL PBPK EXPERIMENT")
-        print("="*60)
-
-        self.generate_dataset()
-        self.prepare_gnn_data()
-
-        # GNN: train or load
-        if os.path.exists("gnn_pbpk_model.pt"):
-            self.load_gnn_model()
+        
+        # Get dataset info from results or current data
+        if 'experiment_info' in self.results:
+            info = self.results['experiment_info']
+            print(f"\nDataset: {info['n_drugs']} drugs, {info['dataset_shape'][1]} time points, {info['dataset_shape'][2]} organs")
+            print(f"Concentration range: [{info['concentration_range'][0]:.3f}, {info['concentration_range'][1]:.3f}] mg/L")
         else:
-            self.train_gnn_model(epochs=50)
-
-        # Traditional PBPK: load or compute
-        self.evaluate_traditional_pbpk()
-
-        # GNN evaluation
-        self.evaluate_gnn_model()
-
-        # Metrics & results
-        self.compute_metrics()
-        self.statistical_significance()
-        self.generate_results_summary()
-
-        print("\nEXPERIMENT COMPLETED SUCCESSFULLY!")
-        return self.results_summary
-
+            print(f"\nDataset: {self.n_drugs} drugs, {self.concentrations.shape[1]} time points, {self.concentrations.shape[2]} organs")
+            print(f"Concentration range: [{self.concentrations.min():.3f}, {self.concentrations.max():.3f}] mg/L")
+        
+        print(f"\nModel Performance:")
+        print(f"{'Model':<12} {'MAPE (%)':<10} {'RMSE':<10} {'R²':<10} {'MAE':<10}")
+        print("-" * 60)
+        
+        for model_name in ['traditional', 'ensemble', 'gnn']:
+            m = metrics[model_name]
+            print(f"{model_name.capitalize():<12} {m['mape']:<10.2f} {m['rmse']:<10.4f} {m['r2']:<10.4f} {m['mae']:<10.4f}")
+        
+        print(f"\nStatistical Significance:")
+        stats = metrics['statistical_tests']
+        print(f"MAPE Improvement: {stats['mape_improvement']:.2f}% ({stats['mape_improvement_pct']:.1f}% relative)")
+        print(f"Paired t-test p-value: {stats['paired_t_test']['p_value']:.4f}")
+        print(f"Wilcoxon test p-value: {stats['wilcoxon_test']['p_value']:.4f}")
+        
+        if stats['paired_t_test']['p_value'] < 0.05:
+            print("✅ GNN significantly outperforms traditional PBPK (p < 0.05)")
+        else:
+            print("❌ No significant difference between GNN and traditional PBPK")
+    
+    def run_full_experiment(self):
+        """Run the complete experiment"""
+        results_path = 'experiment_results.json'
+        
+        # Check if results already exist and force_retrain is False
+        if os.path.exists(results_path) and not self.force_retrain:
+            print(f"📁 Found existing results at {results_path}")
+            print("Loading existing results...")
+            try:
+                with open(results_path, 'r') as f:
+                    self.results = json.load(f)
+                print("✅ Successfully loaded existing results!")
+                self.print_results()
+                return self.results.get('metrics', {})
+            except Exception as e:
+                print(f"❌ Failed to load results: {e}")
+                print("Running new experiment...")
+        elif self.force_retrain:
+            print("🔄 Force retrain enabled - running new experiment...")
+        
+        print("Starting full experiment...")
+        print("="*60)
+        
+        # Generate data
+        self.generate_data()
+        
+        # Prepare GNN data
+        self.prepare_gnn_data()
+        
+        # Initialize models
+        self.initialize_models()
+        
+        # Train GNN model
+        self.train_gnn_model()
+        
+        # Evaluate models
+        metrics = self.evaluate_models()
+        
+        # Print results
+        self.print_results()
+        
+        # Save results
+        self.save_results()
+        
+        return metrics
 
 def main():
-    experiment = ExperimentRunner(n_drugs=30, random_seed=42)
+    """Main function"""
+    import sys
+    
+    print("GNN-PBPK Experiment")
+    print("="*60)
+    
+    # Check for command line arguments
+    force_retrain = '--retrain' in sys.argv or '--force' in sys.argv
+    
+    if force_retrain:
+        print("🔄 Force retrain mode enabled")
+    
+    # Set random seeds for reproducibility
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    # Run experiment
+    experiment = ExperimentRunner(n_drugs=30, n_epochs=100, force_retrain=force_retrain)
     results = experiment.run_full_experiment()
-    print("\nOVERALL PERFORMANCE COMPARISON:")
-    print(results['overall_performance'].to_string(index=False))
+    
     return results
-
 
 if __name__ == "__main__":
     results = main()

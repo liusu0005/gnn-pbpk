@@ -71,10 +71,10 @@ class DrugProperties:
         self.drug_id = drug_id
         
         # Generate realistic drug properties
-        self.molecular_weight = np.random.uniform(150, 800)  # Da
+        self.molecular_weight = np.random.uniform(150, 600)  # Da (realistic range)
         self.log_p = np.random.uniform(-1, 5)  # Lipophilicity
         self.fu_plasma = np.random.uniform(0.01, 0.95)  # Unbound fraction in plasma
-        self.clearance = np.random.uniform(0.1, 10.0)  # L/min/kg
+        self.clearance = np.random.uniform(0.001, 0.033)  # L/min/kg (0.06-2.0 L/h/kg)
         self.volume_distribution = np.random.uniform(0.1, 20.0)  # L/kg
         
         # Tissue-specific properties
@@ -107,12 +107,12 @@ class DrugProperties:
                      'adrenal', 'thyroid']:
             if organ == 'plasma':  # No metabolism in plasma
                 metabolic_rate[organ] = 0.0
-            elif organ == 'liver':  # Primary metabolic organ
-                metabolic_rate[organ] = np.random.uniform(0.1, 2.0)
-            elif organ == 'kidney':  # Secondary elimination
-                metabolic_rate[organ] = np.random.uniform(0.01, 0.5)
+            elif organ == 'liver':  # Primary metabolic organ (L/min/kg)
+                metabolic_rate[organ] = np.random.uniform(0.001, 0.017)  # 0.06-1.0 L/h/kg
+            elif organ == 'kidney':  # Secondary elimination (L/min/kg)
+                metabolic_rate[organ] = np.random.uniform(0.0002, 0.005)  # 0.012-0.3 L/h/kg
             else:
-                metabolic_rate[organ] = np.random.uniform(0.001, 0.1)
+                metabolic_rate[organ] = np.random.uniform(0.00002, 0.0008)  # 0.001-0.05 L/h/kg
         return metabolic_rate
 
 class SyntheticDataGenerator:
@@ -149,35 +149,34 @@ class SyntheticDataGenerator:
         """Simulate drug concentration-time profiles using simplified PBPK model"""
         
         def pbpk_ode(y, t, drug_props, graph):
-            """ODE system for PBPK model - simplified and more stable"""
+            """ODE system for PBPK model - fixed and stable"""
             concentrations = np.maximum(y, 0.0)  # Ensure non-negative
             dydt = np.zeros_like(concentrations)
             
             for i, organ in enumerate(graph.organs):
-                # Simplified flow model - only plasma exchanges with other organs
                 if organ == 'plasma':
-                    # Plasma receives from all organs and distributes to all organs
+                    # Plasma: receives from all organs, distributes to all organs
                     total_inflow = 0
                     total_outflow = 0
                     
                     for j, other_organ in enumerate(graph.organs):
                         if j != i:  # Not plasma itself
                             # Flow from other organs to plasma
-                            flow_rate = graph.blood_flows[other_organ] * 0.1  # Reduced flow rate
+                            flow_rate = graph.blood_flows[other_organ] * 0.01  # Reduced flow rate
                             total_inflow += flow_rate * concentrations[j] * drug_props.fu_plasma
                             
                             # Flow from plasma to other organs
                             total_outflow += flow_rate * concentrations[i] * drug_props.fu_plasma
                     
-                    # Clearance from plasma
-                    clearance = drug_props.clearance * concentrations[i]
+                    # Clearance from plasma (realistic rate)
+                    clearance = drug_props.clearance * concentrations[i] * 0.1  # Reduced clearance rate
                     
                     dydt[i] = (total_inflow - total_outflow - clearance) / graph.volumes[organ]
                     
                 else:
-                    # Other organs: simple exchange with plasma
+                    # Other organs: exchange with plasma
                     plasma_idx = 0
-                    flow_rate = graph.blood_flows[organ] * 0.1  # Reduced flow rate
+                    flow_rate = graph.blood_flows[organ] * 0.01  # Reduced flow rate
                     
                     # Flow from plasma to organ
                     inflow = flow_rate * concentrations[plasma_idx] * drug_props.fu_plasma
@@ -186,14 +185,14 @@ class SyntheticDataGenerator:
                     outflow = flow_rate * concentrations[i] * drug_props.fu_plasma
                     
                     # Tissue-specific metabolism (reduced)
-                    metabolism = drug_props.metabolic_rate[organ] * concentrations[i] * 0.1
+                    metabolism = drug_props.metabolic_rate[organ] * concentrations[i] * 0.01
                     
                     dydt[i] = (inflow - outflow - metabolism) / graph.volumes[organ]
             
             return dydt
         
         # Initial conditions (dose in plasma)
-        initial_dose = 100.0  # mg/kg
+        initial_dose = 0.1  # mg/kg (realistic therapeutic dose)
         y0 = np.zeros(len(self.graph.organs))
         y0[0] = initial_dose / self.graph.volumes['plasma']  # Initial plasma concentration
         
@@ -209,17 +208,17 @@ class SyntheticDataGenerator:
         # Ensure non-negative concentrations (physically realistic)
         solution = np.maximum(solution, 0.0)
         
-        # Add realistic noise only if solution is valid
+        # Add realistic noise (5% of mean concentration)
         if np.any(solution > 0):
-            noise_level = 0.1
-            mean_conc = np.mean(solution[solution > 0])  # Only use positive concentrations
+            noise_level = 0.05  # 5% noise
+            mean_conc = np.mean(solution[solution > 0])
             noise = np.random.normal(0, noise_level * mean_conc, solution.shape)
-            solution = np.maximum(solution + noise, 0.0)  # Ensure non-negative after noise
+            solution = np.maximum(solution + noise, 0.0)
         
         return solution
     
     def _generate_graph_features(self, drug_props: DrugProperties) -> np.ndarray:
-        """Generate node and edge features for the physiological graph"""
+        """Generate node features for the physiological graph"""
         n_organs = len(self.graph.organs)
         
         # Node features: [volume, blood_flow, tissue_affinity, metabolic_rate, fu_plasma]
@@ -232,16 +231,8 @@ class SyntheticDataGenerator:
             node_features[i, 3] = drug_props.metabolic_rate.get(organ, 0.01)
             node_features[i, 4] = drug_props.fu_plasma
         
-        # Edge features: [blood_flow_rate, drug_binding]
-        edge_features = np.zeros((n_organs, n_organs, 2))
-        
-        for i in range(n_organs):
-            for j in range(n_organs):
-                if self.graph.adjacency_matrix[i, j] == 1:
-                    edge_features[i, j, 0] = self.graph.blood_flows[self.graph.organs[i]]
-                    edge_features[i, j, 1] = drug_props.fu_plasma
-        
-        return np.concatenate([node_features.flatten(), edge_features.flatten()])
+        # Return node features as 2D array (n_organs, 5)
+        return node_features
 
 def main():
     """Generate and save synthetic dataset"""
