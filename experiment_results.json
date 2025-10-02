@@ -1,0 +1,336 @@
+{
+  "overall_performance": [
+    {
+      "Model": "Traditional PBPK",
+      "MAPE (%)": 2.377366972864404e+113,
+      "RMSE": 6.116147905615216e+111,
+      "R\u00b2": -1.630302704873693e+220,
+      "MAE": 2.683449933384362e+110
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "MAPE (%)": 1.6067284569491786e+108,
+      "RMSE": 3.987341277029129e+106,
+      "R\u00b2": -6.929136353513676e+209,
+      "MAE": 1.7605960368695644e+105
+    },
+    {
+      "Model": "GNN-PBPK",
+      "MAPE (%)": 2.377366972864404e+113,
+      "RMSE": 6.116147905615216e+111,
+      "R\u00b2": -1.630302704873693e+220,
+      "MAE": 2.683449933384362e+110
+    }
+  ],
+  "organ_performance": [
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "plasma",
+      "MAPE (%)": 1.6111254345679825e+109,
+      "R\u00b2": -6.10662586660945e+218
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "liver",
+      "MAPE (%)": 3.518598253277521e+113,
+      "R\u00b2": -2.898783720297859e+223
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "kidney",
+      "MAPE (%)": 1.6071362518290226e+110,
+      "R\u00b2": -2.06095235552396e+225
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "brain",
+      "MAPE (%)": 1.2660257273454902e+114,
+      "R\u00b2": -3.232918372055542e+223
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "heart",
+      "MAPE (%)": 4.099835148295617e+113,
+      "R\u00b2": -3.561084477094466e+223
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "muscle",
+      "MAPE (%)": 4.682395501371422e+109,
+      "R\u00b2": -1.357208856260284e+222
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "fat",
+      "MAPE (%)": 4.2738330701291174e+113,
+      "R\u00b2": -9.337697674380004e+223
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "lung",
+      "MAPE (%)": 3.096393449219126e+112,
+      "R\u00b2": -1.4373825252703583e+224
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "spleen",
+      "MAPE (%)": 8.996411900092601e+111,
+      "R\u00b2": -2.0674617522809223e+224
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "gut",
+      "MAPE (%)": 1.90807999731966e+112,
+      "R\u00b2": -8.0410030426126e+222
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "bone",
+      "MAPE (%)": 7.877831985684457e+111,
+      "R\u00b2": -1.6694420273698672e+223
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "skin",
+      "MAPE (%)": 6.61594872212059e+113,
+      "R\u00b2": -7.041472337525892e+222
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "pancreas",
+      "MAPE (%)": 8.519536893633917e+108,
+      "R\u00b2": -1.216983373425363e+224
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "adrenal",
+      "MAPE (%)": 2.368971022891428e+113,
+      "R\u00b2": -2.8418484435817826e+224
+    },
+    {
+      "Model": "Traditional PBPK",
+      "Organ": "thyroid",
+      "MAPE (%)": 5.25810328219422e+110,
+      "R\u00b2": -1.1206328160574755e+225
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "plasma",
+      "MAPE (%)": 1.6327459966782445e+104,
+      "R\u00b2": -2.473711090697599e+208
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "liver",
+      "MAPE (%)": 2.2441427102452195e+108,
+      "R\u00b2": -1.1328979342293864e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "kidney",
+      "MAPE (%)": 1.428881234090593e+105,
+      "R\u00b2": -8.141887726567076e+214
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "brain",
+      "MAPE (%)": 8.641101733477043e+108,
+      "R\u00b2": -1.496410420356541e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "heart",
+      "MAPE (%)": 2.6318874259983996e+108,
+      "R\u00b2": -1.4532139584994315e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "muscle",
+      "MAPE (%)": 4.437687856059488e+104,
+      "R\u00b2": -5.996143882233297e+211
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "fat",
+      "MAPE (%)": 3.2995935734590393e+108,
+      "R\u00b2": -5.565023069173716e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "lung",
+      "MAPE (%)": 2.293445560014461e+107,
+      "R\u00b2": -5.853279173372541e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "spleen",
+      "MAPE (%)": 7.2762083724099785e+106,
+      "R\u00b2": -8.531330096201219e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "gut",
+      "MAPE (%)": 1.3504140279976513e+107,
+      "R\u00b2": -3.1995899466229107e+212
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "bone",
+      "MAPE (%)": 6.033593617682905e+106,
+      "R\u00b2": -7.782797323926698e+212
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "skin",
+      "MAPE (%)": 4.1531935580881055e+108,
+      "R\u00b2": -2.753003259022749e+212
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "pancreas",
+      "MAPE (%)": 8.66112303059196e+103,
+      "R\u00b2": -4.933290812419128e+213
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "adrenal",
+      "MAPE (%)": 1.5113867246443954e+108,
+      "R\u00b2": -1.1544657514120578e+214
+    },
+    {
+      "Model": "Ensemble PBPK",
+      "Organ": "thyroid",
+      "MAPE (%)": 4.732007125216396e+105,
+      "R\u00b2": -4.544186662848803e+214
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "plasma",
+      "MAPE (%)": 1.6111254345679825e+109,
+      "R\u00b2": -6.10662586660945e+218
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "liver",
+      "MAPE (%)": 3.518598253277521e+113,
+      "R\u00b2": -2.898783720297859e+223
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "kidney",
+      "MAPE (%)": 1.6071362518290226e+110,
+      "R\u00b2": -2.06095235552396e+225
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "brain",
+      "MAPE (%)": 1.2660257273454902e+114,
+      "R\u00b2": -3.232918372055542e+223
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "heart",
+      "MAPE (%)": 4.099835148295617e+113,
+      "R\u00b2": -3.561084477094466e+223
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "muscle",
+      "MAPE (%)": 4.682395501371422e+109,
+      "R\u00b2": -1.357208856260284e+222
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "fat",
+      "MAPE (%)": 4.2738330701291174e+113,
+      "R\u00b2": -9.337697674380004e+223
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "lung",
+      "MAPE (%)": 3.096393449219126e+112,
+      "R\u00b2": -1.4373825252703583e+224
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "spleen",
+      "MAPE (%)": 8.996411900092601e+111,
+      "R\u00b2": -2.0674617522809223e+224
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "gut",
+      "MAPE (%)": 1.90807999731966e+112,
+      "R\u00b2": -8.0410030426126e+222
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "bone",
+      "MAPE (%)": 7.877831985684457e+111,
+      "R\u00b2": -1.6694420273698672e+223
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "skin",
+      "MAPE (%)": 6.61594872212059e+113,
+      "R\u00b2": -7.041472337525892e+222
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "pancreas",
+      "MAPE (%)": 8.519536893633917e+108,
+      "R\u00b2": -1.216983373425363e+224
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "adrenal",
+      "MAPE (%)": 2.368971022891428e+113,
+      "R\u00b2": -2.8418484435817826e+224
+    },
+    {
+      "Model": "GNN-PBPK",
+      "Organ": "thyroid",
+      "MAPE (%)": 5.25810328219422e+110,
+      "R\u00b2": -1.1206328160574755e+225
+    }
+  ],
+  "improvement_percentage": 0.0,
+  "gnn_vs_traditional": {
+    "GNN MAPE": 2.377366972864404e+113,
+    "Traditional MAPE": 2.377366972864404e+113,
+    "Improvement": 0.0
+  },
+  "significance": {
+    "Traditional PBPK": {
+      "paired_t_MAE_p": NaN,
+      "wilcoxon_MAE_p": 1.0,
+      "paired_t_MAPE_p": NaN,
+      "wilcoxon_MAPE_p": 1.0,
+      "MAPE_improvement_mean_pct": 0.0,
+      "MAPE_improvement_CI95_pct": [
+        0.0,
+        0.0
+      ]
+    },
+    "Ensemble PBPK": {
+      "paired_t_MAE_p": 0.8130495168499705,
+      "wilcoxon_MAE_p": 0.6875,
+      "paired_t_MAPE_p": 0.8130495168499705,
+      "wilcoxon_MAPE_p": 0.6875,
+      "MAPE_improvement_mean_pct": -2.3734581672549088e+113,
+      "MAPE_improvement_CI95_pct": [
+        -7.120374501764727e+113,
+        15503460.484772336
+      ]
+    }
+  },
+  "metadata": {
+    "experiment_date": "2025-10-01T18:33:38.869541",
+    "num_drugs": 5,
+    "num_organs": 15,
+    "time_steps": 96,
+    "train_size": 20,
+    "val_size": 5,
+    "test_size": 5
+  }
+}
