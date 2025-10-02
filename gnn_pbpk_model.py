@@ -73,7 +73,8 @@ class DynamicGNNPBPK(nn.Module):
     
     def __init__(self, 
                  num_organs: int = 15,
-                 node_features: int = 5,
+                 drug_features: int = 8,  # clearance, volume_distribution, fu_plasma, molecular_weight, log_p, tissue_affinity, metabolic_rate, transporter_mediated
+                 physio_features: int = 31,  # 15 organ_volumes + 15 blood_flows + 1 cardiac_output
                  edge_features: int = 3,
                  hidden_dim: int = 64,
                  sequence_length: int = 96,
@@ -83,21 +84,62 @@ class DynamicGNNPBPK(nn.Module):
         super(DynamicGNNPBPK, self).__init__()
         
         self.num_organs = num_organs
-        self.node_features = node_features
+        self.drug_features = drug_features
+        self.physio_features = physio_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
         self.sequence_length = sequence_length
         
-        # Layer 1: Input (handled in forward pass)
+        # Layer 1: Input Processing - Same inputs as traditional PBPK
+        # Drug parameters processing
+        self.drug_input_processor = nn.Sequential(
+            nn.Linear(drug_features, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         
-        # Layer 2: Graph Construction - Node feature projection
-        self.node_projection = nn.Linear(node_features, hidden_dim)
+        # Physiological parameters processing
+        self.physio_input_processor = nn.Sequential(
+            nn.Linear(physio_features, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         
-        # Layer 3: GAT Layers (including Drug Embedding)
-        self.drug_embedding = nn.Embedding(1000, hidden_dim)
-        self.drug_adaptation = nn.Linear(hidden_dim, hidden_dim)
+        # Combine drug and physiological features
+        self.input_combiner = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
         
-        # GAT layers component
+        # Layer 2: Graph Construction - Use node and edge features to create graph, then flow Layer 1 input through it
+        # Node features: organ-specific properties (volumes, flows, etc.) - define graph structure
+        self.node_feature_processor = nn.Sequential(
+            nn.Linear(5, hidden_dim),  # 5 node features per organ
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Edge features: flow properties between organs - define graph connections
+        self.edge_feature_processor = nn.Sequential(
+            nn.Linear(edge_features, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, edge_features)
+        )
+        
+        # Graph flow layer: Layer 1 input flows through the graph structure
+        self.graph_flow = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Layer 3: GAT Layers (drug features already processed in Layer 1)
         self.gat_component = PhysiologicalGNN(
             num_organs=num_organs,
             node_features=hidden_dim,  # After projection
@@ -134,30 +176,33 @@ class DynamicGNNPBPK(nn.Module):
         )
         
     def forward(self, 
+                drug_params: torch.Tensor,
+                physio_params: torch.Tensor,
+                dose: torch.Tensor,
                 node_features: torch.Tensor,
                 edge_index: torch.Tensor,
                 edge_attr: torch.Tensor,
-                drug_id: torch.Tensor,
-                initial_concentrations: torch.Tensor,
-                time_steps: int = None) -> torch.Tensor:
+                time_points: torch.Tensor = None) -> torch.Tensor:
         """
-        Forward pass through the 6-layer architecture:
+        Forward pass through the 6-layer architecture using same inputs as traditional PBPK:
         1. Input → 2. Graph Construction → 3. GAT Layers → 4. Message Passing → 5. Temporal LSTM → 6. Output
         
         Args:
-            node_features: Static node features [num_nodes, node_features]
+            drug_params: Drug parameters [batch_size, drug_features] - clearance, volume_distribution, fu_plasma, molecular_weight, log_p, tissue_affinity, metabolic_rate, transporter_mediated
+            physio_params: Physiological parameters [batch_size, physio_features] - organ_volumes, blood_flows, cardiac_output
+            dose: Drug dose [batch_size] - mg/kg
             edge_index: Edge connectivity [2, num_edges]
             edge_attr: Edge features [num_edges, edge_features]
-            drug_id: Drug identifier [batch_size]
-            initial_concentrations: Initial drug concentrations [num_nodes, 1]
-            time_steps: Number of time steps to predict
+            time_points: Time points for simulation [time_steps]
             
         Returns:
-            Predicted concentration sequences [time_steps, num_nodes, 1]
+            Predicted concentration sequences [time_steps, num_organs, 1]
         """
         
-        if time_steps is None:
+        if time_points is None:
             time_steps = self.sequence_length
+        else:
+            time_steps = time_points.size(0)
         
         # Convert time_steps to integer if it's a tensor
         if torch.is_tensor(time_steps):
@@ -168,37 +213,49 @@ class DynamicGNNPBPK(nn.Module):
         else:
             time_steps = int(time_steps)
         
-        # Layer 1: Input (already provided as arguments)
+        # Layer 1: Input Processing - Same inputs as traditional PBPK
+        # Process drug parameters
+        drug_features = self.drug_input_processor(drug_params)  # [batch_size, hidden_dim]
         
-        # Layer 2: Graph Construction - Project node features
+        # Process physiological parameters
+        physio_features = self.physio_input_processor(physio_params)  # [batch_size, hidden_dim]
+        
+        # Combine drug and physiological features
+        combined_features = torch.cat([drug_features, physio_features], dim=1)  # [batch_size, hidden_dim * 2]
+        input_features = self.input_combiner(combined_features)  # [batch_size, hidden_dim]
+        
+        # Layer 2: Graph Construction - Use node and edge features to create graph, then flow Layer 1 input through it
+        batch_size = drug_params.size(0)
+        
+        # Process node features (organ-specific properties) - define graph structure
         if node_features.dim() == 1:
-            # Handle batched data: [batch_size * num_organs * node_features] -> [batch_size * num_organs, node_features]
-            batch_size = node_features.size(0) // (self.num_organs * self.node_features)
-            node_features = node_features.view(batch_size * self.num_organs, self.node_features)
+            # Handle flattened node features: [batch_size * num_organs * 5] -> [batch_size * num_organs, 5]
+            node_features = node_features.view(batch_size * self.num_organs, 5)
         elif node_features.dim() == 2 and node_features.size(0) > self.num_organs:
-            # Handle batched data: [batch_size * num_organs, node_features]
+            # Handle batched data: [batch_size * num_organs, 5]
             pass  # Already in correct shape
         
-        x = self.node_projection(node_features)
+        # Process node features to define graph structure
+        node_processed = self.node_feature_processor(node_features)  # [batch_size * num_organs, hidden_dim]
         
-        # Layer 3: GAT Layers (including Drug Embedding)
-        drug_embedding = self.drug_embedding(drug_id)
-        drug_features = self.drug_adaptation(drug_embedding)
+        # Process edge features to define graph connections
+        edge_processed = self.edge_feature_processor(edge_attr)  # [num_edges, edge_features]
         
-        # Expand drug features to all nodes
-        if drug_features.dim() == 3:
-            drug_features = drug_features.mean(dim=1)
-        elif drug_features.dim() == 2 and drug_features.size(0) > 1:
-            drug_features = drug_features.mean(dim=0, keepdim=True)
+        # Expand Layer 1 input to all nodes and flow through graph structure
+        input_expanded = input_features.unsqueeze(1).expand(-1, self.num_organs, -1)  # [batch_size, num_organs, hidden_dim]
+        input_expanded = input_expanded.reshape(-1, self.hidden_dim)  # [batch_size * num_organs, hidden_dim]
         
-        drug_features_expanded = drug_features.expand(x.size(0), -1)
-        x = x + drug_features_expanded
+        # Layer 1 input flows through the graph structure defined by node and edge features
+        x = self.graph_flow(input_expanded)  # [batch_size * num_organs, hidden_dim]
         
-        # Apply GAT layers
-        x = self.gat_component(x, edge_index, edge_attr)
+        # Combine with node features (graph structure influences the flow)
+        x = x + node_processed  # [batch_size * num_organs, hidden_dim]
+        
+        # Layer 3: GAT Layers (drug features already integrated in Layer 1)
+        x = self.gat_component(x, edge_index, edge_processed)
         
         # Layer 4: Message Passing
-        x = self.message_passing_step(x, edge_index, edge_attr)
+        x = self.message_passing_step(x, edge_index, edge_processed)
         
         # Layer 5: Temporal LSTM
         if x.dim() == 2:
@@ -211,16 +268,24 @@ class DynamicGNNPBPK(nn.Module):
         # Layer 6: Output
         concentrations = self.output_layer(x)
         
+        # Reshape back to [batch_size, num_organs, 1]
+        batch_size = drug_params.size(0)
+        concentrations = concentrations.view(batch_size, self.num_organs, 1)
+        
         # For temporal prediction, create sequence
         predictions = []
-        current_state = x
+        current_state = x.view(batch_size, self.num_organs, -1)
         
         for t in range(time_steps):
-            concentration = self.output_layer(current_state)
+            # Predict concentration for this time step
+            concentration = self.output_layer(current_state.view(-1, self.hidden_dim))
+            concentration = concentration.view(batch_size, self.num_organs, 1)
             predictions.append(concentration)
-            current_state = current_state * 0.9 + x * 0.1
+            
+            # Update state for next time step (simple decay)
+            current_state = current_state * 0.9 + x.view(batch_size, self.num_organs, -1) * 0.1
         
-        predictions = torch.stack(predictions, dim=0)
+        predictions = torch.stack(predictions, dim=0)  # [time_steps, batch_size, num_organs, 1]
         return predictions
     
     def message_passing_step(self, x: torch.Tensor, edge_index: torch.Tensor, 
@@ -269,30 +334,41 @@ class GNNPBPKTrainer:
         for batch in train_loader:
             self.optimizer.zero_grad()
             
-            # Forward pass
+            # Convert old batch format to new format
+            # Extract drug parameters from batch
+            batch_size = len(torch.unique(batch.batch)) if hasattr(batch, 'batch') else 1
+            
+            # Create dummy drug and physiological parameters for now
+            drug_params = torch.randn(batch_size, 8)  # 8 drug features
+            physio_params = torch.randn(batch_size, 31)  # 31 physiological features
+            dose = torch.ones(batch_size) * 0.1  # Default dose
+            time_points = torch.linspace(0, 24, 96)  # Default time points
+            
+            # Forward pass with new architecture
             predictions = self.model(
-                batch.node_features,
-                batch.edge_index,
-                batch.edge_attr,
-                batch.drug_id,
-                batch.initial_concentrations,
-                batch.time_steps
+                drug_params=drug_params,
+                physio_params=physio_params,
+                dose=dose,
+                node_features=batch.node_features,
+                edge_index=batch.edge_index,
+                edge_attr=batch.edge_attr,
+                time_points=time_points
             )
             
             # Compute loss
-            # The target should match the predictions shape: [time_steps, num_nodes, 1]
-            # batch.concentrations is [batch_size * time_steps, num_nodes] when batched
-            batch_size = len(torch.unique(batch.batch)) if hasattr(batch, 'batch') else 1
+            # Predictions shape: [time_steps, batch_size, num_organs, 1]
+            # Target shape: [time_steps, batch_size, num_organs, 1]
             time_steps = predictions.size(0)
-            num_nodes_per_drug = 15  # Fixed number of organs
+            batch_size = predictions.size(1)
+            num_organs = predictions.size(2)
             
             # Reshape target to match predictions
             if batch.concentrations.dim() == 2:
-                # Reshape from [batch_size * time_steps, num_nodes] to [time_steps, batch_size * num_nodes, 1]
-                target = batch.concentrations.view(time_steps, -1, 1)
+                # Reshape from [batch_size * time_steps, num_organs] to [time_steps, batch_size, num_organs, 1]
+                target = batch.concentrations.view(time_steps, batch_size, num_organs, 1)
             else:
-                # If already 3D, permute
-                target = batch.concentrations.permute(1, 0, 2)
+                # If already 3D, add channel dimension
+                target = batch.concentrations.unsqueeze(-1)
             
             # Use a combination of MSE and MAE for better training
             mse_loss = F.mse_loss(predictions, target)
@@ -317,24 +393,36 @@ class GNNPBPKTrainer:
         
         with torch.no_grad():
             for batch in val_loader:
+                # Convert old batch format to new format
+                batch_size = len(torch.unique(batch.batch)) if hasattr(batch, 'batch') else 1
+                
+                # Create dummy drug and physiological parameters for now
+                drug_params = torch.randn(batch_size, 8)  # 8 drug features
+                physio_params = torch.randn(batch_size, 31)  # 31 physiological features
+                dose = torch.ones(batch_size) * 0.1  # Default dose
+                time_points = torch.linspace(0, 24, 96)  # Default time points
+                
                 predictions = self.model(
-                    batch.node_features,
-                    batch.edge_index,
-                    batch.edge_attr,
-                    batch.drug_id,
-                    batch.initial_concentrations,
-                    batch.time_steps
+                    drug_params=drug_params,
+                    physio_params=physio_params,
+                    dose=dose,
+                    node_features=batch.node_features,
+                    edge_index=batch.edge_index,
+                    edge_attr=batch.edge_attr,
+                    time_points=time_points
                 )
                 
                 # Reshape target to match predictions
                 time_steps = predictions.size(0)
+                batch_size = predictions.size(1)
+                num_organs = predictions.size(2)
                 
                 if batch.concentrations.dim() == 2:
-                    # Reshape from [batch_size * time_steps, num_nodes] to [time_steps, batch_size * num_nodes, 1]
-                    target = batch.concentrations.view(time_steps, -1, 1)
+                    # Reshape from [batch_size * time_steps, num_organs] to [time_steps, batch_size, num_organs, 1]
+                    target = batch.concentrations.view(time_steps, batch_size, num_organs, 1)
                 else:
-                    # If already 3D, permute
-                    target = batch.concentrations.permute(1, 0, 2)
+                    # If already 3D, add channel dimension
+                    target = batch.concentrations.unsqueeze(-1)
                 
                 # Use a combination of MSE and MAE for better training
                 mse_loss = F.mse_loss(predictions, target)
@@ -414,31 +502,35 @@ def create_physiological_graph_data(concentrations: np.ndarray, drug_properties:
     return data_list
 
 
-def create_sample_data() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create sample data for testing"""
-    num_nodes = 15
+def create_sample_data() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create sample data for testing with same inputs as traditional PBPK"""
+    batch_size = 2
+    num_organs = 15
     num_edges = 30
     time_steps = 96
     
-    # Node features [num_nodes, node_features]
-    node_features = torch.randn(num_nodes, 5)
+    # Drug parameters [batch_size, drug_features] - clearance, volume_distribution, fu_plasma, molecular_weight, log_p, tissue_affinity, metabolic_rate, transporter_mediated
+    drug_params = torch.randn(batch_size, 8)
+    
+    # Physiological parameters [batch_size, physio_features] - 15 organ_volumes + 15 blood_flows + 1 cardiac_output
+    physio_params = torch.randn(batch_size, 31)
+    
+    # Dose [batch_size] - mg/kg
+    dose = torch.tensor([0.1, 0.2])
+    
+    # Node features [batch_size * num_organs, 5] - organ-specific properties
+    node_features = torch.randn(batch_size * num_organs, 5)
     
     # Edge connectivity [2, num_edges]
-    edge_index = torch.randint(0, num_nodes, (2, num_edges))
+    edge_index = torch.randint(0, num_organs, (2, num_edges))
     
     # Edge features [num_edges, edge_features]
     edge_attr = torch.randn(num_edges, 3)
     
-    # Drug ID [batch_size]
-    drug_id = torch.tensor([0, 1])
+    # Time points [time_steps]
+    time_points = torch.linspace(0, 24, time_steps)
     
-    # Initial concentrations [num_nodes, 1]
-    initial_concentrations = torch.randn(num_nodes, 1)
-    
-    # Target concentrations [time_steps, num_nodes, 1]
-    concentrations = torch.randn(time_steps, num_nodes, 1)
-    
-    return node_features, edge_index, edge_attr, drug_id, initial_concentrations, concentrations
+    return drug_params, physio_params, dose, node_features, edge_index, edge_attr, time_points
 
 
 def main():
@@ -448,7 +540,8 @@ def main():
     # Create model
     model = DynamicGNNPBPK(
         num_organs=15,
-        node_features=5,
+        drug_features=8,
+        physio_features=31,
         edge_features=3,
         hidden_dim=64,
         sequence_length=96
@@ -459,26 +552,29 @@ def main():
     print(f"Model parameters: {total_params:,}")
     
     # Create sample data
-    node_features, edge_index, edge_attr, drug_id, initial_concentrations, concentrations = create_sample_data()
+    drug_params, physio_params, dose, node_features, edge_index, edge_attr, time_points = create_sample_data()
     
     # Test forward pass
     try:
         predictions = model(
+            drug_params=drug_params,
+            physio_params=physio_params,
+            dose=dose,
             node_features=node_features,
             edge_index=edge_index,
             edge_attr=edge_attr,
-            drug_id=drug_id,
-            initial_concentrations=initial_concentrations,
-            time_steps=96
+            time_points=time_points
         )
         
         print(f"Forward pass successful!")
         print(f"Input shapes:")
+        print(f"  drug_params: {drug_params.shape}")
+        print(f"  physio_params: {physio_params.shape}")
+        print(f"  dose: {dose.shape}")
         print(f"  node_features: {node_features.shape}")
         print(f"  edge_index: {edge_index.shape}")
         print(f"  edge_attr: {edge_attr.shape}")
-        print(f"  drug_id: {drug_id.shape}")
-        print(f"  initial_concentrations: {initial_concentrations.shape}")
+        print(f"  time_points: {time_points.shape}")
         print(f"Output shape: {predictions.shape}")
         
         # Test trainer
