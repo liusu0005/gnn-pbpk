@@ -16,7 +16,7 @@ from typing import Dict, List, Tuple, Optional
 
 class PhysiologicalGNN(nn.Module):
     """
-    Graph Neural Network for PBPK modeling following the architecture diagram
+    Simple GNN component for DynamicGNNPBPK - just basic GAT layers
     """
     
     def __init__(self, 
@@ -25,9 +25,7 @@ class PhysiologicalGNN(nn.Module):
                  edge_features: int = 3,
                  hidden_dim: int = 64,
                  num_heads: int = 4,
-                 num_layers: int = 3,
-                 temporal_hidden: int = 32,
-                 output_dim: int = 1):
+                 num_layers: int = 3):
         super(PhysiologicalGNN, self).__init__()
         
         self.num_organs = num_organs
@@ -35,22 +33,13 @@ class PhysiologicalGNN(nn.Module):
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
         
-        # 1. Drug Embedding (as shown in diagram)
-        self.drug_embedding = nn.Embedding(1000, hidden_dim)
-        self.drug_adaptation = nn.Linear(hidden_dim, hidden_dim)
-        
-        # 2. Graph Construction - Node feature projection
-        self.node_projection = nn.Linear(node_features, hidden_dim)
-        
-        # 3. GAT Layers (with drug embedding integration)
+        # Simple GAT layers only
         self.gat_layers = nn.ModuleList()
         for i in range(num_layers):
             if i == 0:
-                # First layer: node features + drug embedding
                 self.gat_layers.append(GATConv(hidden_dim, hidden_dim, heads=num_heads, 
                                               edge_dim=edge_features, concat=True, add_self_loops=False))
             else:
-                # Subsequent layers
                 self.gat_layers.append(GATConv(hidden_dim * num_heads, hidden_dim, 
                                               heads=num_heads, edge_dim=edge_features, concat=True, add_self_loops=False))
         
@@ -58,119 +47,28 @@ class PhysiologicalGNN(nn.Module):
         self.gat_layers.append(GATConv(hidden_dim * num_heads, hidden_dim, 
                                       heads=1, edge_dim=edge_features, concat=False, add_self_loops=False))
         
-        # 4. Message Passing (separate from GAT as shown in diagram)
-        self.message_function = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + edge_features, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        self.node_update_function = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        
-        # 5. Temporal LSTM (as shown in diagram)
-        self.temporal_lstm = nn.LSTM(hidden_dim, temporal_hidden, batch_first=True)
-        self.temporal_linear = nn.Linear(temporal_hidden, hidden_dim)
-        
-        # 6. Output (as shown in diagram)
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, output_dim),
-            nn.Sigmoid()  # Scale to [0, 1] range
-        )
-        
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, 
-                edge_attr: torch.Tensor, drug_id: torch.Tensor, 
-                batch: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass following the architecture diagram:
-        Input → Graph Construction → GAT Layers → Message Passing → Temporal LSTM → Output
-        """
+                edge_attr: torch.Tensor) -> torch.Tensor:
+        """Simple forward pass through GAT layers only"""
         
-        # 1. Drug Embedding (as shown in diagram)
-        drug_embedding = self.drug_embedding(drug_id)
-        drug_features = self.drug_adaptation(drug_embedding)
-        
-        # 2. Graph Construction - Project node features
-        if x.dim() == 1:
-            # Handle flattened node features (75,) -> (15, 5)
-            x = x.view(self.num_organs, self.node_features)
-        
-        # Project node features to hidden dimension
-        x = self.node_projection(x)  # [num_organs, hidden_dim]
-        
-        # Apply drug features to all nodes
-        if batch is not None:
-            drug_features_expanded = drug_features[batch]
-        else:
-            # Expand drug features to all nodes
-            if drug_features.dim() == 3:
-                drug_features = drug_features.mean(dim=1)
-            elif drug_features.dim() == 2 and drug_features.size(0) > 1:
-                drug_features = drug_features.mean(dim=0, keepdim=True)
-            
-            drug_features_expanded = drug_features.expand(x.size(0), -1)
-        
-        # Combine node features with drug embedding
-        x = x + drug_features_expanded  # Add drug information to node features
-        
-        # 3. GAT Layers (as shown in diagram)
         for i, gat_layer in enumerate(self.gat_layers):
             x = gat_layer(x, edge_index, edge_attr)
             if i < len(self.gat_layers) - 1:
                 x = F.elu(x)
                 x = F.dropout(x, training=self.training)
         
-        # 4. Message Passing (separate step as shown in diagram)
-        x = self.message_passing_step(x, edge_index, edge_attr)
-        
-        # 5. Temporal LSTM (as shown in diagram)
-        if x.dim() == 2:
-            # Add time dimension for LSTM: [num_organs, hidden_dim] -> [1, num_organs, hidden_dim]
-            x = x.unsqueeze(0)
-        
-        x, _ = self.temporal_lstm(x)  # [1, num_organs, temporal_hidden]
-        x = self.temporal_linear(x)   # [1, num_organs, hidden_dim]
-        x = x.squeeze(0)              # [num_organs, hidden_dim]
-        
-        # 6. Output (as shown in diagram)
-        concentrations = self.output_layer(x)
-        
-        return concentrations
-    
-    def message_passing_step(self, x: torch.Tensor, edge_index: torch.Tensor, 
-                           edge_attr: torch.Tensor) -> torch.Tensor:
-        """
-        Custom message passing step for drug concentration flow
-        """
-        row, col = edge_index
-        
-        # Create messages
-        edge_features = torch.cat([x[row], x[col], edge_attr], dim=1)
-        messages = self.message_function(edge_features)
-        
-        # Aggregate messages
-        aggregated = torch.zeros_like(x)
-        for i in range(x.size(0)):
-            mask = (col == i)
-            if mask.sum() > 0:
-                aggregated[i] = messages[mask].mean(dim=0)
-        
-        # Update nodes
-        updated_features = torch.cat([x, aggregated], dim=1)
-        x_new = self.node_update_function(updated_features)
-        
-        return x_new
+        return x
 
 
 class DynamicGNNPBPK(nn.Module):
     """
-    Dynamic GNN-PBPK model following the architecture diagram
+    Dynamic GNN-PBPK model implementing the complete 6-layer architecture:
+    1. Input
+    2. Graph Construction (node and edge features)
+    3. GAT Layers (including Drug Embedding)
+    4. Message Passing
+    5. Temporal LSTM
+    6. Output
     """
     
     def __init__(self, 
@@ -185,39 +83,55 @@ class DynamicGNNPBPK(nn.Module):
         super(DynamicGNNPBPK, self).__init__()
         
         self.num_organs = num_organs
+        self.node_features = node_features
+        self.edge_features = edge_features
+        self.hidden_dim = hidden_dim
         self.sequence_length = sequence_length
         
-        # Base GNN following the architecture diagram
-        self.base_gnn = PhysiologicalGNN(
+        # Layer 1: Input (handled in forward pass)
+        
+        # Layer 2: Graph Construction - Node feature projection
+        self.node_projection = nn.Linear(node_features, hidden_dim)
+        
+        # Layer 3: GAT Layers (including Drug Embedding)
+        self.drug_embedding = nn.Embedding(1000, hidden_dim)
+        self.drug_adaptation = nn.Linear(hidden_dim, hidden_dim)
+        
+        # GAT layers component
+        self.gat_component = PhysiologicalGNN(
             num_organs=num_organs,
-            node_features=node_features,
+            node_features=hidden_dim,  # After projection
             edge_features=edge_features,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
-            num_layers=num_layers,
-            temporal_hidden=temporal_hidden,
-            output_dim=1  # Direct concentration output
+            num_layers=num_layers
         )
         
-        # Initial concentration embedding
-        self.initial_concentration_embedding = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+        # Layer 4: Message Passing
+        self.message_function = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + edge_features, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Concentration prediction head
-        self.concentration_head = nn.Sequential(
+        self.node_update_function = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Layer 5: Temporal LSTM
+        self.temporal_lstm = nn.LSTM(hidden_dim, temporal_hidden, batch_first=True)
+        self.temporal_linear = nn.Linear(temporal_hidden, hidden_dim)
+        
+        # Layer 6: Output
+        self.output_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()  # Scale to [0, 1] range
         )
-        
-        # Temporal sequence modeling for multi-time-step prediction
-        self.temporal_sequence_lstm = nn.LSTM(hidden_dim, temporal_hidden, batch_first=True)
-        self.temporal_output = nn.Linear(temporal_hidden, 1)
         
     def forward(self, 
                 node_features: torch.Tensor,
@@ -227,7 +141,8 @@ class DynamicGNNPBPK(nn.Module):
                 initial_concentrations: torch.Tensor,
                 time_steps: int = None) -> torch.Tensor:
         """
-        Forward pass for temporal sequence prediction
+        Forward pass through the 6-layer architecture:
+        1. Input → 2. Graph Construction → 3. GAT Layers → 4. Message Passing → 5. Temporal LSTM → 6. Output
         
         Args:
             node_features: Static node features [num_nodes, node_features]
@@ -253,28 +168,84 @@ class DynamicGNNPBPK(nn.Module):
         else:
             time_steps = int(time_steps)
         
-        num_nodes = node_features.size(0)
+        # Layer 1: Input (already provided as arguments)
         
-        # Initial hidden state: embed initial concentrations
-        current_hidden = self.initial_concentration_embedding(initial_concentrations)
+        # Layer 2: Graph Construction - Project node features
+        if node_features.dim() == 1:
+            # Handle batched data: [batch_size * num_organs * node_features] -> [batch_size * num_organs, node_features]
+            batch_size = node_features.size(0) // (self.num_organs * self.node_features)
+            node_features = node_features.view(batch_size * self.num_organs, self.node_features)
+        elif node_features.dim() == 2 and node_features.size(0) > self.num_organs:
+            # Handle batched data: [batch_size * num_organs, node_features]
+            pass  # Already in correct shape
         
+        x = self.node_projection(node_features)
+        
+        # Layer 3: GAT Layers (including Drug Embedding)
+        drug_embedding = self.drug_embedding(drug_id)
+        drug_features = self.drug_adaptation(drug_embedding)
+        
+        # Expand drug features to all nodes
+        if drug_features.dim() == 3:
+            drug_features = drug_features.mean(dim=1)
+        elif drug_features.dim() == 2 and drug_features.size(0) > 1:
+            drug_features = drug_features.mean(dim=0, keepdim=True)
+        
+        drug_features_expanded = drug_features.expand(x.size(0), -1)
+        x = x + drug_features_expanded
+        
+        # Apply GAT layers
+        x = self.gat_component(x, edge_index, edge_attr)
+        
+        # Layer 4: Message Passing
+        x = self.message_passing_step(x, edge_index, edge_attr)
+        
+        # Layer 5: Temporal LSTM
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        
+        x, _ = self.temporal_lstm(x)
+        x = self.temporal_linear(x)
+        x = x.squeeze(0)
+        
+        # Layer 6: Output
+        concentrations = self.output_layer(x)
+        
+        # For temporal prediction, create sequence
         predictions = []
+        current_state = x
         
         for t in range(time_steps):
-            # Apply GNN to current hidden state
-            hidden_features = self.base_gnn(
-                current_hidden, edge_index, edge_attr, drug_id
-            )
-            
-            # Predict concentration for this time step
-            concentration = self.concentration_head(hidden_features)
+            concentration = self.output_layer(current_state)
             predictions.append(concentration)
-            
-            # Update hidden state for next time step
-            current_hidden = hidden_features
+            current_state = current_state * 0.9 + x * 0.1
         
         predictions = torch.stack(predictions, dim=0)
         return predictions
+    
+    def message_passing_step(self, x: torch.Tensor, edge_index: torch.Tensor, 
+                           edge_attr: torch.Tensor) -> torch.Tensor:
+        """
+        Custom message passing step for drug concentration flow
+        """
+        row, col = edge_index
+        
+        # Create messages
+        edge_features = torch.cat([x[row], x[col], edge_attr], dim=1)
+        messages = self.message_function(edge_features)
+        
+        # Aggregate messages
+        aggregated = torch.zeros_like(x)
+        for i in range(x.size(0)):
+            mask = (col == i)
+            if mask.sum() > 0:
+                aggregated[i] = messages[mask].mean(dim=0)
+        
+        # Update nodes
+        updated_features = torch.cat([x, aggregated], dim=1)
+        x_new = self.node_update_function(updated_features)
+        
+        return x_new
 
 
 class GNNPBPKTrainer:
